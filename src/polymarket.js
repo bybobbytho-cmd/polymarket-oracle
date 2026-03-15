@@ -64,51 +64,96 @@ function candidateWindowStarts(sec) {
   return [now - remainder - sec, now - remainder];
 }
 
+/**
+ * Robust midpoint fetcher with retries and order book fallback.
+ */
 async function clobMidpoints(tokenIds) {
   const ids = tokenIds.filter(Boolean).map(String);
-  if (!ids.length) return {};
+  if (ids.length < 2) return {};
 
-  // Attempt 1: GET /midpoints
-  try {
-    const url =
-      `${CLOB_BASE}/midpoints?` +
-      new URLSearchParams({ token_ids: ids.join(",") }).toString();
-    const data = await fetchJson(url);
-    if (data && typeof data === "object") return data;
-  } catch (e) {
-    if (e?.status !== 400) {
-      // continue
-    }
-  }
+  const maxAttempts = 5;
+  const delayMs = 2000; // 2 seconds
 
-  // Attempt 2: POST /midpoints
-  try {
-    const url = `${CLOB_BASE}/midpoints`;
-    const payload = ids.map((id) => ({ token_id: id }));
-    const data = await fetchJson(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    if (data && typeof data === "object") return data;
-  } catch (e) {
-    // continue
-  }
-
-  // Attempt 3: individual GET /midpoint
-  const out = {};
-  for (const id of ids) {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // 1) GET /midpoints
     try {
-      const url =
-        `${CLOB_BASE}/midpoint?` + new URLSearchParams({ token_id: id }).toString();
-      const data = await fetchJson(url);
-      const mp = data?.mid_price ?? data?.midPrice ?? null;
-      if (mp != null) out[id] = String(mp);
-    } catch {
-      // ignore
+      const url = `${CLOB_BASE}/midpoints?` + new URLSearchParams({ token_ids: ids.join(",") }).toString();
+      const data = await fetchJson(url, { timeoutMs: 5000 });
+      if (data && typeof data === "object" && Object.keys(data).length > 0) {
+        return data;
+      }
+    } catch (e) {
+      console.log(`GET attempt ${attempt} failed:`, e.message);
+    }
+
+    // 2) POST /midpoints
+    try {
+      const url = `${CLOB_BASE}/midpoints`;
+      const payload = ids.map((id) => ({ token_id: id }));
+      const data = await fetchJson(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+        timeoutMs: 5000,
+      });
+      if (data && typeof data === "object" && Object.keys(data).length > 0) {
+        return data;
+      }
+    } catch (e) {
+      console.log(`POST attempt ${attempt} failed:`, e.message);
+    }
+
+    // 3) Individual GET /midpoint
+    const out = {};
+    let individualSuccess = false;
+    for (const id of ids) {
+      try {
+        const url = `${CLOB_BASE}/midpoint?` + new URLSearchParams({ token_id: id }).toString();
+        const data = await fetchJson(url, { timeoutMs: 5000 });
+        const mp = data?.mid_price ?? data?.midPrice ?? null;
+        if (mp != null) {
+          out[id] = String(mp);
+          individualSuccess = true;
+        }
+      } catch (e) {
+        console.log(`Individual GET for ${id} attempt ${attempt} failed:`, e.message);
+      }
+    }
+    if (individualSuccess) return out;
+
+    // 4) Fallback: order book
+    const bookResult = {};
+    let bookSuccess = false;
+    for (const id of ids) {
+      try {
+        const url = `${CLOB_BASE}/book?` + new URLSearchParams({ token_id: id }).toString();
+        const data = await fetchJson(url, { timeoutMs: 5000 });
+        const bids = data.bids || [];
+        const asks = data.asks || [];
+        if (bids.length > 0 && asks.length > 0) {
+          const midpoint = (parseFloat(bids[0].price) + parseFloat(asks[0].price)) / 2;
+          bookResult[id] = String(midpoint);
+          bookSuccess = true;
+        } else if (bids.length > 0) {
+          bookResult[id] = bids[0].price;
+          bookSuccess = true;
+        } else if (asks.length > 0) {
+          bookResult[id] = asks[0].price;
+          bookSuccess = true;
+        }
+      } catch (e) {
+        console.log(`Order book for ${id} attempt ${attempt} failed:`, e.message);
+      }
+    }
+    if (bookSuccess) return bookResult;
+
+    // Wait before next attempt
+    if (attempt < maxAttempts) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
-  return out;
+
+  return {}; // All attempts failed
 }
 
 export async function resolveUpDownMarketAndPrice({ asset, interval }) {
